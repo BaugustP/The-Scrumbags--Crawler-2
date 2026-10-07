@@ -36,27 +36,25 @@
   in the original AVR version. There is no way to check the rear is clear
   before reversing - all recovery reversing is done "blind".
 
-  Behavior (unchanged from the updated AVR version):
+  Behavior:
 
     DRIVE - normal state. Centers itself between the two side boards with a
     PID on the left/right sensor difference, and slows down as the front
     sensor sees a wall/corner getting close.
 
     TURN - triggered the instant the front sensor sees a corner wall inside
-    CORNER_TRIGGER_DISTANCE_CM. Full steering lock, reduced fixed speed,
-    held for TURN_DURATION_MS (extended a bit if the front is still blocked
-    once that expires), then hands back control to DRIVE.
+    CORNER_TRIGGER_DISTANCE_CM. Reduced fixed speed, held for
+    TURN_DURATION_MS (extended a bit if the front is still blocked once that
+    expires), then hands back control to DRIVE.
 
-    Track direction (auto-learned): the very first corner is steered purely
-    on the turn PID's raw left/right sign, accumulating that raw error over
-    the whole corner. Once the corner ends, if the accumulated error was
-    strong enough (>= TURN_DIRECTION_LOCK_THRESHOLD_CM) its sign is latched
-    as the track's turn direction for every corner after it - only the
-    *magnitude* of the turn PID is trusted from then on, steered toward the
-    locked direction, since sensor readings right at a sharp corner are the
-    least reliable moment to trust for direction. If the first corner's
-    signal was too weak/ambiguous to trust, direction stays unlearned and
-    the next corner gets a fresh attempt.
+    Turn direction (decided fresh at EVERY corner, no learning): the track
+    can run in any rotation, clockwise, counter-clockwise or mixed. At the
+    start of each corner the left/right difference is averaged over
+    TURN_DECIDE_MS. While that window runs, the car steers provisionally by
+    the running sign of the average; once it ends, the direction is locked
+    for the rest of that corner only. Nothing is remembered between
+    corners. The turn PID only supplies the steering MAGNITUDE (with a
+    minimum of TURN_MIN_STEER_DEG), the sign comes from the decision.
 
   Recovery (reverse + wiggle) triggers on either:
     1. Front emergency stop - front sensor inside STOP_DISTANCE_CM.
@@ -158,7 +156,7 @@
 #define CORNER_TRIGGER_DISTANCE_CM 80u // front wall closer than this -> commit to a hard-lock TURN
 
 #define TURN_SPEED              200u    // fixed, slow speed while executing a hard-lock turn
-#define TURN_DURATION_MS        600u   // how long to hold full lock through a corner - THE main knob to tune
+#define TURN_DURATION_MS        600u   // how long to hold the turn through a corner - THE main knob to tune
 #define TURN_MAX_EXTRA_MS       800u   // if still blocked after TURN_DURATION_MS, keep turning up to this much longer
 
 #define SERVO_MIN_US      1000u  // full-left pulse width  - calibrate to your linkage
@@ -447,7 +445,7 @@ static float pid_update(SteeringPID *pid, float error, float dt) {
 }
 
 // ---------- Sensor smoothing ----------
-#define SENSOR_FILTER_ALPHA 1.0f // no filtering, matching the updated AVR version
+#define SENSOR_FILTER_ALPHA 0.9f // slight filtering
 
 static float filtered_diff = 0.0f;
 static uint8_t filtered_diff_valid = 0;
@@ -462,15 +460,10 @@ static float filter_update(float raw_value) {
     return filtered_diff;
 }
 
-// ---------- Turn PID (with direction learning) ----------
+// ---------- Turn PID ----------
 #define TURN_KP  0.5f
 #define TURN_KI  0.0f
 #define TURN_KD  0.0f
-
-// Guards against latching onto noise: if the first corner's summed error
-// never exceeds this magnitude, the direction is left unlearned and the
-// next corner gets a fresh attempt at learning it.
-#define TURN_DIRECTION_LOCK_THRESHOLD_CM 150L
 
 static SteeringPID turn_pid = {
     .kp = TURN_KP,
@@ -480,13 +473,13 @@ static SteeringPID turn_pid = {
     .prev_error = 0.0f
 };
 
-// track_direction_known/track_turn_right latch the track's turn direction
-// the first time it's successfully learned; turn_direction_accum is the
-// running sum of raw (right-left) error collected over the course of a
-// corner that's still being learned.
-static uint8_t track_direction_known = 0;
-static uint8_t track_turn_right = 0;
-static long turn_direction_accum = 0;
+// ---------- Per-corner direction decision (no learning between corners) ----------
+#define TURN_DECIDE_MS        150u  // average left/right difference over this long at the start of each corner
+#define TURN_MIN_STEER_DEG    40u   // minimum steering angle away from center during a turn
+
+static long    turn_diff_accum = 0; // running sum of (right-left) for the current corner
+static uint8_t turn_decided    = 0; // direction locked for this corner?
+static uint8_t turn_right      = 0; // locked direction for this corner (valid when turn_decided)
 
 static void reset_steering(void) {
     pid_reset(&steer_pid);
@@ -645,7 +638,8 @@ void app_main(void) {
                 turn_start_us = micros();
                 reset_steering();
                 reset_stuck_detector();
-                turn_direction_accum = 0;
+                turn_diff_accum = 0;
+                turn_decided = 0;
                 continue;
             }
 
@@ -684,20 +678,26 @@ void app_main(void) {
             float dt = (float)(now - last_pid_us) / 1000000.0f;
             last_pid_us = now;
 
+            uint32_t elapsed_ms = (now - turn_start_us) / 1000UL;
+
             long diff = constrain_long(dist_right - dist_left, -(long)MAX_DISTANCE_CM, (long)MAX_DISTANCE_CM);
             float offset = pid_update(&turn_pid, (float)diff, dt);
 
-            if (!track_direction_known) {
-                // Still learning: trust the PID's raw sign completely, and
-                // keep a running tally of the raw error so the direction
-                // can be latched once this corner is done.
-                turn_direction_accum += diff;
-            } else {
-                // Direction already learned - only the PID's magnitude is
-                // trusted here, steered toward the locked side.
-                float magnitude = (offset < 0.0f) ? -offset : offset;
-                offset = track_turn_right ? magnitude : -magnitude;
+            // Decide this corner's direction: average the side difference for
+            // TURN_DECIDE_MS, then lock it for the rest of this corner.
+            if (!turn_decided) {
+                turn_diff_accum += diff;
+                if (elapsed_ms >= TURN_DECIDE_MS) {
+                    turn_right = (turn_diff_accum >= 0); // more room on the right -> turn right
+                    turn_decided = 1;
+                }
             }
+            uint8_t steer_right = turn_decided ? turn_right : (turn_diff_accum >= 0);
+
+            // Only the PID's magnitude is used; the sign comes from the decision above.
+            float magnitude = (offset < 0.0f) ? -offset : offset;
+            if (magnitude < (float)TURN_MIN_STEER_DEG) magnitude = (float)TURN_MIN_STEER_DEG;
+            offset = steer_right ? magnitude : -magnitude;
 
             int angle = (int)SERVO_CENTER_DEG + (int)offset;
             if (angle < (int)SERVO_MIN_DEG) angle = (int)SERVO_MIN_DEG;
@@ -706,18 +706,9 @@ void app_main(void) {
 
             drive_forward(TURN_SPEED);
 
-            uint32_t elapsed_ms = (micros() - turn_start_us) / 1000UL;
-
             if (elapsed_ms >= TURN_DURATION_MS) {
                 if (dist_mid >= CORNER_TRIGGER_DISTANCE_CM ||
                     elapsed_ms >= (TURN_DURATION_MS + TURN_MAX_EXTRA_MS)) {
-                    if (!track_direction_known &&
-                        labs(turn_direction_accum) >= TURN_DIRECTION_LOCK_THRESHOLD_CM) {
-                        // This corner's signal was strong enough to trust -
-                        // lock it in for every corner from here on.
-                        track_turn_right = (turn_direction_accum >= 0);
-                        track_direction_known = 1;
-                    }
                     state = STATE_DRIVE;
                     reset_steering();
                     reset_stuck_detector();
