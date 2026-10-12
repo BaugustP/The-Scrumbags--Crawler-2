@@ -1,6 +1,8 @@
 /*
   Self-Driving RC Car - pure C, ESP-IDF, for the Arduino Nano ESP32 (ESP32-S3)
 
+  THIS CODE IS AI GENERATED (CLAUDE SONNET 5)
+
   Ported from the updated ATmega328P/Arduino-Nano version, keeping the SAME
   physical wiring: every sensor/servo/motor/start wire plugs into the exact
   same D-pin / A-pin header position it did on the old Nano. Only the
